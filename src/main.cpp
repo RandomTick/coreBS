@@ -17,10 +17,10 @@ void PrintUsage()
         << L"Usage:\n"
         << L"  coreBS.exe (--exe <name.exe> | --pid <pid> | --title <window title>) [options]\n\n"
         << L"Options:\n"
-        << L"  --out <path>       Output file path.\n"
+        << L"  --out <path>       Output file path. If omitted, coreBS timestamps it.\n"
         << L"  --fps <n>          Target capture rate. Default: 60.\n"
         << L"  --no-cursor        Disable cursor capture.\n"
-        << L"  --audio-off        Present for forward compatibility. Audio is off in the MVP build.\n"
+        << L"  --audio-off        Disable target-process audio capture.\n"
         << L"  --verbose          Print verbose logs.\n"
         << L"  --help             Show this message.\n";
 }
@@ -73,12 +73,15 @@ corebs::Recorder::Options ParseArguments(int argc, wchar_t** argv)
 
 int wmain(int argc, wchar_t** argv)
 {
+    bool mediaFoundationStarted = false;
+
     try {
         const auto options = ParseArguments(argc, argv);
         corebs::utils::SetVerboseLogging(options.verbose);
 
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
         corebs::utils::ThrowIfFailed(MFStartup(MF_VERSION), L"MFStartup failed");
+        mediaFoundationStarted = true;
 
         corebs::Recorder recorder;
         const int exitCode = recorder.Run(options);
@@ -86,6 +89,9 @@ int wmain(int argc, wchar_t** argv)
         MFShutdown();
         return exitCode;
     } catch (const std::exception& ex) {
+        if (mediaFoundationStarted) {
+            MFShutdown();
+        }
         corebs::utils::LogError(corebs::utils::Utf8ToWide(ex.what()));
     }
 

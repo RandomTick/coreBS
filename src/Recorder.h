@@ -23,7 +23,7 @@ public:
         std::optional<std::filesystem::path> outputPath;
         int fps = 60;
         bool captureCursor = true;
-        bool audioEnabled = false;
+        bool audioEnabled = true;
         bool verbose = false;
     };
 
@@ -42,15 +42,23 @@ private:
         WindowInfo window;
     };
 
+    struct OutputPlan {
+        std::filesystem::path finalOutputPath;
+        std::filesystem::path videoPath;
+        std::optional<std::filesystem::path> audioPath;
+        bool needsMux = false;
+    };
+
     ResolvedTarget ResolveTarget(const Options& options) const;
-    std::filesystem::path ResolveOutputPath(const Options& options) const;
+    OutputPlan ResolveOutputPlan(const Options& options) const;
+    void FinalizeOutputs(int64_t baseQpc, const AudioCapture::Stats& audioStats) const;
     void RequestStop(StopReason reason);
     void StartProcessMonitor();
     void StopProcessMonitor();
 
     Options m_options{};
     ResolvedTarget m_target{};
-    std::filesystem::path m_outputPath;
+    OutputPlan m_outputPlan{};
 
     HANDLE m_processHandle = nullptr;
     HANDLE m_monitorStopEvent = nullptr;

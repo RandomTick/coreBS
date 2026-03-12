@@ -3,6 +3,8 @@
 #include "SignalHandler.h"
 #include "Utils.h"
 
+#include <filesystem>
+#include <iomanip>
 #include <sstream>
 
 namespace corebs {
@@ -29,13 +31,42 @@ std::wstring ExtensionLower(const std::filesystem::path& path)
     return utils::ToLower(path.extension().wstring());
 }
 
+void EnsureParentDirectoryExists(const std::filesystem::path& path)
+{
+    const auto parent = path.parent_path();
+    if (parent.empty()) {
+        return;
+    }
+
+    std::error_code error;
+    std::filesystem::create_directories(parent, error);
+    if (error) {
+        utils::Fail(L"Failed to create output directory " + parent.wstring() + L": " + utils::Utf8ToWide(error.message()));
+    }
+}
+
+std::wstring FormatSeconds(double seconds)
+{
+    std::wstringstream stream;
+    stream << std::fixed << std::setprecision(6) << seconds;
+    return stream.str();
+}
+
+void RemoveFileIfPresent(const std::filesystem::path& path)
+{
+    std::error_code error;
+    std::filesystem::remove(path, error);
+}
+
 }  // namespace
 
 int Recorder::Run(const Options& options)
 {
     m_options = options;
+    m_stopRequested.store(false);
+    m_stopReason = StopReason::None;
     m_target = ResolveTarget(options);
-    m_outputPath = ResolveOutputPath(options);
+    m_outputPlan = ResolveOutputPlan(options);
     m_processHandle = ProcessFinder::OpenProcessForMonitoring(m_target.process.pid);
     m_monitorStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     if (m_monitorStopEvent == nullptr) {
@@ -44,15 +75,17 @@ int Recorder::Run(const Options& options)
 
     utils::LogInfo(L"Chosen PID: " + std::to_wstring(m_target.process.pid) + L" (" + m_target.process.exeName + L")");
     utils::LogInfo(L"Chosen HWND: " + utils::FormatPointer(m_target.window.hwnd));
-    utils::LogInfo(L"Chosen output path: " + m_outputPath.wstring());
+    utils::LogInfo(L"Chosen output path: " + m_outputPlan.finalOutputPath.wstring());
     utils::LogInfo(L"Video size: " + utils::FormatSize(
         static_cast<unsigned int>(m_target.window.bounds.right - m_target.window.bounds.left),
         static_cast<unsigned int>(m_target.window.bounds.bottom - m_target.window.bounds.top)));
     utils::LogInfo(L"FPS: " + std::to_wstring(options.fps));
-    utils::LogInfo(L"Audio enabled: no (video-only MVP build)");
-
-    if (options.audioEnabled) {
-        utils::LogWarning(L"Audio capture is not in this first commit yet. Continuing with video only.");
+    utils::LogInfo(std::wstring(L"Audio enabled: ") + (options.audioEnabled ? L"yes" : L"no"));
+    if (options.verbose) {
+        utils::LogVerbose(L"Video intermediate path: " + m_outputPlan.videoPath.wstring());
+        if (m_outputPlan.audioPath) {
+            utils::LogVerbose(L"Audio intermediate path: " + m_outputPlan.audioPath->wstring());
+        }
     }
 
     const auto baseQpc = utils::QueryPerformanceCounterValue();
@@ -60,16 +93,35 @@ int Recorder::Run(const Options& options)
     SignalHandler::Install([this] { RequestStop(StopReason::CtrlC); });
     StartProcessMonitor();
 
+    bool videoStarted = false;
+    bool audioStarted = false;
     try {
         m_videoCapture.Start(VideoCapture::StartOptions{
             m_target.window.hwnd,
-            m_outputPath,
+            m_outputPlan.videoPath,
             options.fps,
             options.captureCursor,
             options.verbose,
             baseQpc,
         });
+        videoStarted = true;
+
+        if (options.audioEnabled && m_outputPlan.audioPath) {
+            m_audioCapture.Start(AudioCapture::StartOptions{
+                m_target.process.pid,
+                *m_outputPlan.audioPath,
+                options.verbose,
+                baseQpc,
+            });
+            audioStarted = true;
+        }
     } catch (...) {
+        if (audioStarted) {
+            m_audioCapture.Stop();
+        }
+        if (videoStarted) {
+            m_videoCapture.Stop();
+        }
         StopProcessMonitor();
         SignalHandler::Uninstall();
         if (m_monitorStopEvent != nullptr) {
@@ -83,7 +135,7 @@ int Recorder::Run(const Options& options)
         throw;
     }
 
-    utils::LogInfo(L"Start reason: target window capture started.");
+    utils::LogInfo(L"Start reason: target capture started.");
 
     {
         std::unique_lock<std::mutex> lock(m_stopMutex);
@@ -91,7 +143,16 @@ int Recorder::Run(const Options& options)
     }
 
     utils::LogInfo(L"Stop reason: " + StopReasonToString(m_stopReason));
-    m_videoCapture.Stop();
+
+    AudioCapture::Stats audioStats{};
+    if (audioStarted) {
+        m_audioCapture.Stop();
+        audioStats = m_audioCapture.GetStats();
+    }
+    if (videoStarted) {
+        m_videoCapture.Stop();
+    }
+
     StopProcessMonitor();
     SignalHandler::Uninstall();
 
@@ -104,16 +165,17 @@ int Recorder::Run(const Options& options)
         m_processHandle = nullptr;
     }
 
-    const auto stats = m_videoCapture.GetStats();
-    std::wstringstream stream;
-    stream << L"Finalized video-only output at " << m_outputPath.wstring()
-           << L" (" << stats.writtenFrames << L" frames";
+    const auto videoStats = m_videoCapture.GetStats();
     if (options.verbose) {
-        stream << L", dropped=" << stats.droppedFrames;
+        utils::LogVerbose(L"Video frames written: " + std::to_wstring(videoStats.writtenFrames));
+        utils::LogVerbose(L"Video frames dropped: " + std::to_wstring(videoStats.droppedFrames));
+        if (options.audioEnabled) {
+            utils::LogVerbose(L"Audio bytes written: " + std::to_wstring(audioStats.bytesWritten));
+            utils::LogVerbose(L"Audio discontinuities: " + std::to_wstring(audioStats.discontinuities));
+        }
     }
-    stream << L")";
-    utils::LogInfo(stream.str());
 
+    FinalizeOutputs(baseQpc, audioStats);
     return 0;
 }
 
@@ -187,20 +249,98 @@ Recorder::ResolvedTarget Recorder::ResolveTarget(const Options& options) const
     return {*process, windows.front()};
 }
 
-std::filesystem::path Recorder::ResolveOutputPath(const Options& options) const
+Recorder::OutputPlan Recorder::ResolveOutputPlan(const Options& options) const
 {
-    auto output = options.outputPath.value_or(utils::DefaultOutputPath(false));
-    if (!output.has_extension()) {
-        output += L".mp4";
+    OutputPlan plan;
+    plan.finalOutputPath = options.outputPath.value_or(utils::DefaultOutputPath(options.audioEnabled));
+    if (!plan.finalOutputPath.has_extension()) {
+        plan.finalOutputPath += options.audioEnabled ? L".mkv" : L".mp4";
     }
 
-    const auto extension = ExtensionLower(output);
-    if (extension != L".mp4") {
-        utils::LogWarning(L"Video-only MVP output uses MP4. Replacing requested extension with .mp4 for this commit.");
-        output.replace_extension(L".mp4");
+    EnsureParentDirectoryExists(plan.finalOutputPath);
+
+    const auto extension = ExtensionLower(plan.finalOutputPath);
+    if (!options.audioEnabled && extension == L".mp4") {
+        plan.videoPath = plan.finalOutputPath;
+        return plan;
     }
 
-    return output;
+    plan.videoPath = utils::AppendSuffixToStem(utils::ReplaceExtension(plan.finalOutputPath, L".mp4"), L".video");
+    EnsureParentDirectoryExists(plan.videoPath);
+
+    if (options.audioEnabled) {
+        plan.audioPath = utils::AppendSuffixToStem(utils::ReplaceExtension(plan.finalOutputPath, L".wav"), L".audio");
+        EnsureParentDirectoryExists(*plan.audioPath);
+    }
+
+    plan.needsMux = plan.videoPath != plan.finalOutputPath || plan.audioPath.has_value();
+    return plan;
+}
+
+void Recorder::FinalizeOutputs(int64_t baseQpc, const AudioCapture::Stats& audioStats) const
+{
+    if (!m_outputPlan.needsMux) {
+        utils::LogInfo(L"Finalized output at " + m_outputPlan.finalOutputPath.wstring());
+        return;
+    }
+
+    if (!utils::ToolExists(L"ffmpeg.exe")) {
+        if (m_outputPlan.audioPath) {
+            utils::LogWarning(L"FFmpeg was not found. Keeping separate files: " + m_outputPlan.videoPath.wstring() + L" and " + m_outputPlan.audioPath->wstring());
+        } else {
+            utils::LogWarning(L"FFmpeg was not found. Keeping video-only MP4 at " + m_outputPlan.videoPath.wstring());
+        }
+        return;
+    }
+
+    std::vector<std::wstring> arguments;
+    arguments.push_back(L"-y");
+    arguments.push_back(L"-i");
+    arguments.push_back(m_outputPlan.videoPath.wstring());
+
+    if (m_outputPlan.audioPath) {
+        const double audioOffsetSeconds = static_cast<double>(audioStats.startQpc - baseQpc) / static_cast<double>(utils::QueryPerformanceFrequencyValue());
+        if (audioOffsetSeconds > 0.0005) {
+            arguments.push_back(L"-itsoffset");
+            arguments.push_back(FormatSeconds(audioOffsetSeconds));
+        }
+        arguments.push_back(L"-i");
+        arguments.push_back(m_outputPlan.audioPath->wstring());
+        arguments.push_back(L"-map");
+        arguments.push_back(L"0:v:0");
+        arguments.push_back(L"-map");
+        arguments.push_back(L"1:a:0");
+        arguments.push_back(L"-c:v");
+        arguments.push_back(L"copy");
+        arguments.push_back(L"-c:a");
+        arguments.push_back(L"aac");
+        arguments.push_back(L"-b:a");
+        arguments.push_back(L"192k");
+        arguments.push_back(L"-shortest");
+    } else {
+        arguments.push_back(L"-c");
+        arguments.push_back(L"copy");
+    }
+
+    if (ExtensionLower(m_outputPlan.finalOutputPath) == L".mp4") {
+        arguments.push_back(L"-movflags");
+        arguments.push_back(L"+faststart");
+    }
+
+    arguments.push_back(m_outputPlan.finalOutputPath.wstring());
+
+    const auto exitCode = utils::RunProcess(L"ffmpeg.exe", arguments, m_options.verbose);
+    if (exitCode != 0) {
+        utils::LogWarning(L"FFmpeg muxing failed with exit code " + std::to_wstring(exitCode) + L". Keeping intermediate files.");
+        return;
+    }
+
+    RemoveFileIfPresent(m_outputPlan.videoPath);
+    if (m_outputPlan.audioPath) {
+        RemoveFileIfPresent(*m_outputPlan.audioPath);
+    }
+
+    utils::LogInfo(L"Finalized output at " + m_outputPlan.finalOutputPath.wstring());
 }
 
 void Recorder::RequestStop(StopReason reason)

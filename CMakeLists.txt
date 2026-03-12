@@ -53,7 +53,9 @@ target_link_libraries(coreBS PRIVATE
     mfplat
     mfreadwrite
     mfuuid
+    mmdevapi
     ole32
+    propsys
     runtimeobject
     shlwapi
     user32

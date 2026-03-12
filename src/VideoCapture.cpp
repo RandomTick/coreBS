@@ -109,9 +109,11 @@ void VideoCapture::Stop()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_running.exchange(false)) {
+    if (!m_session && !m_framePool && !m_sinkWriter) {
         return;
     }
+
+    m_running.store(false);
 
     if (m_framePool) {
         m_framePool.FrameArrived(m_frameArrivedToken);
