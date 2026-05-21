@@ -17,12 +17,16 @@ void PrintUsage()
         << L"Usage:\n"
         << L"  coreBS.exe (--exe <name.exe> | --pid <pid> | --title <window title>) [options]\n\n"
         << L"Options:\n"
-        << L"  --out <path>       Output file path. If omitted, coreBS timestamps it.\n"
-        << L"  --fps <n>          Target capture rate. Default: 60.\n"
-        << L"  --no-cursor        Disable cursor capture.\n"
-        << L"  --audio-off        Disable target-process audio capture.\n"
-        << L"  --verbose          Print verbose logs.\n"
-        << L"  --help             Show this message.\n";
+        << L"  --out <path>              Final output path for the session recording.\n"
+        << L"  --fps <n>                 Target output rate. Default: 60.\n"
+        << L"  --no-cursor               Disable cursor capture for the game source.\n"
+        << L"  --audio-off               Disable target-process audio capture.\n"
+        << L"  --livesplit-title <text>  Window title match for LiveSplit. Default: LiveSplit.\n"
+        << L"  --audio-sync-ms <n>       Shift audio earlier by <n> ms. Default: 1000.\n"
+        << L"  --wait                    Wait for the target if it is not available yet (default).\n"
+        << L"  --no-wait                 Fail immediately if the target is not available at startup.\n"
+        << L"  --verbose                 Print verbose logs.\n"
+        << L"  --help                    Show this message.\n";
 }
 
 corebs::Recorder::Options ParseArguments(int argc, wchar_t** argv)
@@ -56,6 +60,17 @@ corebs::Recorder::Options ParseArguments(int argc, wchar_t** argv)
             options.captureCursor = false;
         } else if (argument == L"--audio-off") {
             options.audioEnabled = false;
+        } else if (argument == L"--audio-sync-ms") {
+            options.audioSyncMs = std::stoi(requireValue(L"--audio-sync-ms"));
+            if (options.audioSyncMs < -1000 || options.audioSyncMs > 1000) {
+                corebs::utils::Fail(L"--audio-sync-ms must be between -1000 and 1000.");
+            }
+        } else if (argument == L"--livesplit-title") {
+            options.liveSplitTitle = requireValue(L"--livesplit-title");
+        } else if (argument == L"--wait") {
+            options.waitForTarget = true;
+        } else if (argument == L"--no-wait") {
+            options.waitForTarget = false;
         } else if (argument == L"--verbose") {
             options.verbose = true;
         } else if (argument == L"--help" || argument == L"-h" || argument == L"/?") {

@@ -11,10 +11,13 @@ namespace {
 std::wstring GetWindowTitle(HWND hwnd)
 {
     const auto length = GetWindowTextLengthW(hwnd);
-    std::wstring title(static_cast<size_t>(length), L'\0');
-    if (length > 0) {
-        GetWindowTextW(hwnd, title.data(), length + 1);
+    if (length == 0) {
+        return {};
     }
+
+    std::wstring title(static_cast<size_t>(length) + 1, L'\0');
+    const auto copied = GetWindowTextW(hwnd, title.data(), length + 1);
+    title.resize(static_cast<size_t>(copied));
     return title;
 }
 
@@ -115,6 +118,10 @@ bool WindowFinder::IsCaptureCandidate(HWND hwnd)
     if ((GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
         return false;
     }
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) {
+        return false;
+    }
+
 
     RECT bounds{};
     if (!GetWindowRect(hwnd, &bounds)) {

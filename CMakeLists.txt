@@ -5,6 +5,8 @@ project(coreBS VERSION 0.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+option(COREBS_BUILD_OBS_PLUGIN "Build the experimental OBS source plugin" OFF)
+
 
 add_executable(coreBS
     src/main.cpp
@@ -14,6 +16,7 @@ add_executable(coreBS
     src/SignalHandler.cpp
     src/Utils.cpp
     src/VideoCapture.cpp
+    src/WindowCaptureSource.cpp
     src/WindowFinder.cpp
 )
 
@@ -65,3 +68,8 @@ target_link_libraries(coreBS PRIVATE
 set_target_properties(coreBS PROPERTIES
     OUTPUT_NAME "coreBS"
 )
+
+
+if(COREBS_BUILD_OBS_PLUGIN)
+    add_subdirectory(obs-plugin)
+endif()

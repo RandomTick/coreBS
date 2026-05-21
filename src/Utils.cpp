@@ -4,6 +4,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <vector>
 
 namespace corebs::utils {
 
@@ -33,6 +34,26 @@ void LogLine(const wchar_t* prefix, const std::wstring& message)
 {
     std::lock_guard<std::mutex> lock(g_logMutex);
     std::wcout << prefix << message << std::endl;
+}
+
+std::filesystem::path ResolveToolPath(const std::wstring& executable)
+{
+    const std::filesystem::path candidate(executable);
+    if (candidate.has_parent_path() || candidate.is_absolute()) {
+        return candidate;
+    }
+
+    const DWORD required = SearchPathW(nullptr, executable.c_str(), nullptr, 0, nullptr, nullptr);
+    if (required == 0) {
+        return {};
+    }
+
+    std::vector<wchar_t> buffer(static_cast<size_t>(required), L'\0');
+    if (SearchPathW(nullptr, executable.c_str(), nullptr, required, buffer.data(), nullptr) == 0) {
+        return {};
+    }
+
+    return std::filesystem::path(buffer.data());
 }
 
 }  // namespace
@@ -256,13 +277,17 @@ bool FileExists(const std::filesystem::path& path)
 
 bool ToolExists(const std::wstring& name)
 {
-    wchar_t buffer[MAX_PATH]{};
-    return SearchPathW(nullptr, name.c_str(), nullptr, MAX_PATH, buffer, nullptr) > 0;
+    return !ResolveToolPath(name).empty();
 }
 
 DWORD RunProcess(const std::wstring& executable, const std::vector<std::wstring>& arguments, bool verbose)
 {
-    std::wstring commandLine = QuoteCommandLineArg(executable);
+    const auto resolvedExecutable = ResolveToolPath(executable);
+    if (resolvedExecutable.empty()) {
+        Fail(L"Failed to locate " + executable + L" on disk.");
+    }
+
+    std::wstring commandLine = QuoteCommandLineArg(resolvedExecutable.wstring());
     for (const auto& argument : arguments) {
         commandLine += L' ';
         commandLine += QuoteCommandLineArg(argument);
@@ -280,7 +305,7 @@ DWORD RunProcess(const std::wstring& executable, const std::vector<std::wstring>
     mutableCommand.push_back(L'\0');
 
     if (!CreateProcessW(
-            executable.c_str(),
+            resolvedExecutable.c_str(),
             mutableCommand.data(),
             nullptr,
             nullptr,
@@ -290,7 +315,7 @@ DWORD RunProcess(const std::wstring& executable, const std::vector<std::wstring>
             nullptr,
             &startupInfo,
             &processInfo)) {
-        Fail(L"Failed to launch " + executable + L": " + FormatWindowsError(GetLastError()));
+        Fail(L"Failed to launch " + resolvedExecutable.wstring() + L": " + FormatWindowsError(GetLastError()));
     }
 
     WaitForSingleObject(processInfo.hProcess, INFINITE);

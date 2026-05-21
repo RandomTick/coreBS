@@ -30,9 +30,13 @@ void SignalHandler::Uninstall()
 BOOL WINAPI SignalHandler::HandleCtrlEvent(DWORD ctrlType)
 {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT || ctrlType == CTRL_CLOSE_EVENT) {
-        std::lock_guard<std::mutex> lock(g_callbackMutex);
-        if (g_callback) {
-            g_callback();
+        Callback callback;
+        {
+            std::lock_guard<std::mutex> lock(g_callbackMutex);
+            callback = g_callback;
+        }
+        if (callback) {
+            callback();
         }
         return TRUE;
     }

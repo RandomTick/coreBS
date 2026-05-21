@@ -7,7 +7,7 @@
 #include <wrl/client.h>
 #include <wrl/implements.h>
 
-#include <fstream>
+#include <algorithm>
 #include <vector>
 
 namespace corebs {
@@ -54,59 +54,25 @@ private:
     Microsoft::WRL::ComPtr<IAudioClient> m_audioClient;
 };
 
-void WriteFourCc(std::ofstream& stream, const char (&text)[5])
+std::unique_ptr<WAVEFORMATEX, AudioCapture::CoTaskMemFreeDeleter> CreatePcmFormat(WORD channels, DWORD sampleRate, WORD bitsPerSample)
 {
-    stream.write(text, 4);
-}
+    auto* raw = reinterpret_cast<WAVEFORMATEX*>(CoTaskMemAlloc(sizeof(WAVEFORMATEX)));
+    if (raw == nullptr) {
+        utils::Fail(L"CoTaskMemAlloc failed for audio capture format.");
+    }
 
-template <typename T>
-void WriteBinary(std::ofstream& stream, const T& value)
-{
-    stream.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    ZeroMemory(raw, sizeof(WAVEFORMATEX));
+    raw->wFormatTag = WAVE_FORMAT_PCM;
+    raw->nChannels = channels;
+    raw->nSamplesPerSec = sampleRate;
+    raw->wBitsPerSample = bitsPerSample;
+    raw->nBlockAlign = static_cast<WORD>((channels * bitsPerSample) / 8);
+    raw->nAvgBytesPerSec = raw->nSamplesPerSec * raw->nBlockAlign;
+    raw->cbSize = 0;
+    return std::unique_ptr<WAVEFORMATEX, AudioCapture::CoTaskMemFreeDeleter>(raw);
 }
 
 }  // namespace
-
-struct AudioCapture::WaveFileSession {
-    explicit WaveFileSession(const std::filesystem::path& path)
-        : stream(path, std::ios::binary | std::ios::trunc)
-    {
-        if (!stream) {
-            utils::Fail(L"Failed to open WAV output file: " + path.wstring());
-        }
-    }
-
-    void WriteHeader(const WAVEFORMATEX& format)
-    {
-        const uint32_t formatSize = static_cast<uint32_t>(sizeof(WAVEFORMATEX) + format.cbSize);
-        WriteFourCc(stream, "RIFF");
-        WriteBinary<uint32_t>(stream, 0);
-        WriteFourCc(stream, "WAVE");
-        WriteFourCc(stream, "fmt ");
-        WriteBinary<uint32_t>(stream, formatSize);
-        stream.write(reinterpret_cast<const char*>(&format), formatSize);
-        WriteFourCc(stream, "data");
-        dataSizeOffset = static_cast<std::streamoff>(stream.tellp());
-        WriteBinary<uint32_t>(stream, 0);
-    }
-
-    void Finalize(uint64_t dataBytes)
-    {
-        stream.flush();
-        const auto endPosition = static_cast<uint64_t>(stream.tellp());
-        const auto riffSize = static_cast<uint32_t>(endPosition - 8);
-        const auto wavDataSize = static_cast<uint32_t>(std::min<uint64_t>(dataBytes, 0xFFFFFFFFULL));
-
-        stream.seekp(4, std::ios::beg);
-        WriteBinary<uint32_t>(stream, riffSize);
-        stream.seekp(dataSizeOffset, std::ios::beg);
-        WriteBinary<uint32_t>(stream, wavDataSize);
-        stream.flush();
-    }
-
-    std::ofstream stream;
-    std::streamoff dataSizeOffset = 0;
-};
 
 AudioCapture::AudioCapture() = default;
 
@@ -133,98 +99,159 @@ void AudioCapture::Start(const StartOptions& options)
     m_options = options;
     m_stats = {};
 
-    m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    m_sampleReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    m_activationCompleteEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (m_stopEvent == nullptr || m_sampleReadyEvent == nullptr || m_activationCompleteEvent == nullptr) {
-        utils::Fail(L"Failed to create audio capture event handles: " + utils::FormatWindowsError(GetLastError()));
+    auto cleanupOnFailure = [this]() {
+        if (m_stopEvent != nullptr) {
+            SetEvent(m_stopEvent);
+        }
+        if (m_captureThread.joinable()) {
+            m_captureThread.join();
+        }
+        if (m_audioClient) {
+            m_audioClient->Stop();
+        }
+        m_captureClient.Reset();
+        m_audioClient.Reset();
+        m_mixFormat.reset();
+        if (m_activationCompleteEvent != nullptr) {
+            CloseHandle(m_activationCompleteEvent);
+            m_activationCompleteEvent = nullptr;
+        }
+        if (m_sampleReadyEvent != nullptr) {
+            CloseHandle(m_sampleReadyEvent);
+            m_sampleReadyEvent = nullptr;
+        }
+        if (m_stopEvent != nullptr) {
+            CloseHandle(m_stopEvent);
+            m_stopEvent = nullptr;
+        }
+    };
+
+    try {
+        m_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        m_sampleReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        m_activationCompleteEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (m_stopEvent == nullptr || m_sampleReadyEvent == nullptr || m_activationCompleteEvent == nullptr) {
+            utils::Fail(L"Failed to create audio capture event handles: " + utils::FormatWindowsError(GetLastError()));
+        }
+
+        AUDIOCLIENT_ACTIVATION_PARAMS activationParams{};
+        activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+        activationParams.ProcessLoopbackParams.TargetProcessId = options.targetPid;
+        activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
+
+        PROPVARIANT activationPropVariant{};
+        activationPropVariant.vt = VT_BLOB;
+        activationPropVariant.blob.cbSize = sizeof(activationParams);
+        activationPropVariant.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
+
+        Microsoft::WRL::ComPtr<AudioInterfaceActivator> activator = Microsoft::WRL::Make<AudioInterfaceActivator>(m_activationCompleteEvent);
+        Microsoft::WRL::ComPtr<IActivateAudioInterfaceAsyncOperation> asyncOperation;
+
+        utils::ThrowIfFailed(
+            ActivateAudioInterfaceAsync(
+                VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+                __uuidof(IAudioClient),
+                &activationPropVariant,
+                activator.Get(),
+                &asyncOperation),
+            L"ActivateAudioInterfaceAsync failed");
+
+        const auto activationWait = WaitForSingleObject(m_activationCompleteEvent, INFINITE);
+        if (activationWait != WAIT_OBJECT_0) {
+            utils::Fail(L"Waiting for ActivateAudioInterfaceAsync failed.");
+        }
+
+        utils::ThrowIfFailed(activator->Result(), L"Application loopback activation failed");
+        m_audioClient = activator->GetAudioClient();
+
+        m_mixFormat = CreatePcmFormat(2, 44100, 16);
+
+        const DWORD streamFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        utils::ThrowIfFailed(
+            m_audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 0, 0, m_mixFormat.get(), nullptr),
+            L"IAudioClient::Initialize failed");
+        utils::ThrowIfFailed(m_audioClient->SetEventHandle(m_sampleReadyEvent), L"IAudioClient::SetEventHandle failed");
+        utils::ThrowIfFailed(m_audioClient->GetService(IID_PPV_ARGS(&m_captureClient)), L"IAudioClient::GetService(IAudioCaptureClient) failed");
+
+        REFERENCE_TIME streamLatency = 0;
+        const HRESULT streamLatencyHr = m_audioClient->GetStreamLatency(&streamLatency);
+        if (SUCCEEDED(streamLatencyHr) && streamLatency > 0) {
+            m_streamLatencyHns = static_cast<uint64_t>(streamLatency);
+        } else {
+            m_streamLatencyHns = 0;
+            if (m_options.verbose) {
+                utils::LogVerbose(L"IAudioClient::GetStreamLatency unavailable. Using zero latency compensation.");
+            }
+        }
+
+        m_stats.sampleRate = m_mixFormat->nSamplesPerSec;
+        m_stats.channels = m_mixFormat->nChannels;
+        if (m_options.onFormat) {
+            m_options.onFormat(*m_mixFormat);
+        }
+
+        m_captureStartQpc = utils::QueryPerformanceCounterValue();
+        m_totalCapturedFrames = 0;
+        const int64_t attachAnchorQpc = m_options.attachQpc != 0 ? m_options.attachQpc : m_captureStartQpc;
+        m_attachOffsetHns = static_cast<uint64_t>(utils::QpcTicksToHundredsOfNanoseconds(std::max<int64_t>(0, attachAnchorQpc - m_options.baseQpc)));
+        m_firstPacketQpcHns = 0;
+        m_stats.startQpc = m_captureStartQpc;
+
+        m_running.store(true);
+        m_captureThread = std::thread(&AudioCapture::CaptureLoop, this);
+        utils::ThrowIfFailed(m_audioClient->Start(), L"IAudioClient::Start failed");
+    } catch (...) {
+        cleanupOnFailure();
+        throw;
     }
-
-    AUDIOCLIENT_ACTIVATION_PARAMS activationParams{};
-    activationParams.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
-    activationParams.ProcessLoopbackParams.TargetProcessId = options.targetPid;
-    activationParams.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE;
-
-    PROPVARIANT activationPropVariant{};
-    activationPropVariant.vt = VT_BLOB;
-    activationPropVariant.blob.cbSize = sizeof(activationParams);
-    activationPropVariant.blob.pBlobData = reinterpret_cast<BYTE*>(&activationParams);
-
-    Microsoft::WRL::ComPtr<AudioInterfaceActivator> activator = Microsoft::WRL::Make<AudioInterfaceActivator>(m_activationCompleteEvent);
-    Microsoft::WRL::ComPtr<IActivateAudioInterfaceAsyncOperation> asyncOperation;
-
-    utils::ThrowIfFailed(
-        ActivateAudioInterfaceAsync(
-            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-            __uuidof(IAudioClient),
-            &activationPropVariant,
-            activator.Get(),
-            &asyncOperation),
-        L"ActivateAudioInterfaceAsync failed");
-
-    const auto activationWait = WaitForSingleObject(m_activationCompleteEvent, INFINITE);
-    if (activationWait != WAIT_OBJECT_0) {
-        utils::Fail(L"Waiting for ActivateAudioInterfaceAsync failed.");
-    }
-
-    utils::ThrowIfFailed(activator->Result(), L"Application loopback activation failed");
-    m_audioClient = activator->GetAudioClient();
-
-    WAVEFORMATEX* rawMixFormat = nullptr;
-    utils::ThrowIfFailed(m_audioClient->GetMixFormat(&rawMixFormat), L"IAudioClient::GetMixFormat failed");
-    m_mixFormat.reset(rawMixFormat);
-
-    const DWORD streamFlags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    utils::ThrowIfFailed(
-        m_audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, streamFlags, 0, 0, m_mixFormat.get(), nullptr),
-        L"IAudioClient::Initialize failed");
-    utils::ThrowIfFailed(m_audioClient->SetEventHandle(m_sampleReadyEvent), L"IAudioClient::SetEventHandle failed");
-    utils::ThrowIfFailed(m_audioClient->GetService(IID_PPV_ARGS(&m_captureClient)), L"IAudioClient::GetService(IAudioCaptureClient) failed");
-
-    m_stats.sampleRate = m_mixFormat->nSamplesPerSec;
-    m_stats.channels = m_mixFormat->nChannels;
-    OpenWaveFile();
-
-    m_running.store(true);
-    m_captureThread = std::thread(&AudioCapture::CaptureLoop, this);
-    m_stats.startQpc = utils::QueryPerformanceCounterValue();
-    utils::ThrowIfFailed(m_audioClient->Start(), L"IAudioClient::Start failed");
 }
 
 void AudioCapture::Stop()
 {
+    HANDLE stopEvent = nullptr;
+    Microsoft::WRL::ComPtr<IAudioClient> audioClient;
+    std::thread captureThread;
+    HANDLE activationCompleteEvent = nullptr;
+    HANDLE sampleReadyEvent = nullptr;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+
+        stopEvent = m_stopEvent;
+        sampleReadyEvent = m_sampleReadyEvent;
+        activationCompleteEvent = m_activationCompleteEvent;
+        audioClient = m_audioClient;
+        if (m_captureThread.joinable()) {
+            captureThread = std::move(m_captureThread);
+        }
+        m_running.store(false);
+    }
+
+    if (stopEvent != nullptr) {
+        SetEvent(stopEvent);
+    }
+    if (audioClient) {
+        audioClient->Stop();
+    }
+    if (captureThread.joinable()) {
+        captureThread.join();
+    }
+
     std::lock_guard<std::mutex> lock(m_mutex);
-
-    if (!m_running.exchange(false)) {
-        return;
-    }
-
-    if (m_audioClient) {
-        m_audioClient->Stop();
-    }
-    if (m_stopEvent != nullptr) {
-        SetEvent(m_stopEvent);
-    }
-    if (m_captureThread.joinable()) {
-        m_captureThread.join();
-    }
-
-    FinalizeWaveFile();
-
     m_captureClient.Reset();
     m_audioClient.Reset();
     m_mixFormat.reset();
 
-    if (m_activationCompleteEvent != nullptr) {
-        CloseHandle(m_activationCompleteEvent);
+    if (activationCompleteEvent != nullptr) {
+        CloseHandle(activationCompleteEvent);
         m_activationCompleteEvent = nullptr;
     }
-    if (m_sampleReadyEvent != nullptr) {
-        CloseHandle(m_sampleReadyEvent);
+    if (sampleReadyEvent != nullptr) {
+        CloseHandle(sampleReadyEvent);
         m_sampleReadyEvent = nullptr;
     }
-    if (m_stopEvent != nullptr) {
-        CloseHandle(m_stopEvent);
+    if (stopEvent != nullptr) {
+        CloseHandle(stopEvent);
         m_stopEvent = nullptr;
     }
 }
@@ -235,35 +262,23 @@ AudioCapture::Stats AudioCapture::GetStats() const
     return m_stats;
 }
 
-void AudioCapture::OpenWaveFile()
-{
-    m_waveFile = std::make_unique<WaveFileSession>(m_options.outputPath);
-    m_waveFile->WriteHeader(*m_mixFormat);
-}
-
-void AudioCapture::FinalizeWaveFile()
-{
-    if (!m_waveFile) {
-        return;
-    }
-
-    m_waveFile->Finalize(m_stats.bytesWritten);
-    m_waveFile.reset();
-}
-
 void AudioCapture::CaptureLoop()
 {
-    HANDLE waitHandles[2] = {m_stopEvent, m_sampleReadyEvent};
+    try {
+        HANDLE waitHandles[2] = {m_stopEvent, m_sampleReadyEvent};
 
-    while (true) {
-        const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
-        if (waitResult == WAIT_OBJECT_0) {
-            CaptureAvailablePackets();
-            return;
+        while (true) {
+            const DWORD waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, INFINITE);
+            if (waitResult == WAIT_OBJECT_0) {
+                CaptureAvailablePackets();
+                return;
+            }
+            if (waitResult == WAIT_OBJECT_0 + 1) {
+                CaptureAvailablePackets();
+            }
         }
-        if (waitResult == WAIT_OBJECT_0 + 1) {
-            CaptureAvailablePackets();
-        }
+    } catch (const std::exception& ex) {
+        utils::LogWarning(L"Audio capture thread stopped: " + utils::Utf8ToWide(ex.what()));
     }
 }
 
@@ -277,12 +292,31 @@ void AudioCapture::CaptureAvailablePackets()
         BYTE* data = nullptr;
         UINT32 frameCount = 0;
         DWORD flags = 0;
-
+        UINT64 devicePosition = 0;
+        UINT64 qpcPositionHns = 0;
         utils::ThrowIfFailed(
-            m_captureClient->GetBuffer(&data, &frameCount, &flags, nullptr, nullptr),
+            m_captureClient->GetBuffer(&data, &frameCount, &flags, &devicePosition, &qpcPositionHns),
             L"IAudioCaptureClient::GetBuffer failed");
 
-        if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0) {
+        const uint64_t packetStartFrames = m_totalCapturedFrames;
+        m_totalCapturedFrames += frameCount;
+
+        uint64_t relativePositionHns = 0;
+        if (qpcPositionHns > 0) {
+            if (m_firstPacketQpcHns == 0) {
+                m_firstPacketQpcHns = qpcPositionHns;
+            }
+            uint64_t packetTimelineHns = qpcPositionHns >= m_firstPacketQpcHns ? (qpcPositionHns - m_firstPacketQpcHns) : 0ULL;
+            packetTimelineHns = packetTimelineHns > m_streamLatencyHns ? (packetTimelineHns - m_streamLatencyHns) : 0ULL;
+            relativePositionHns = m_attachOffsetHns + packetTimelineHns;
+        } else {
+            const uint64_t packetOffsetHns = (static_cast<uint64_t>(packetStartFrames) * 10000000ULL) /
+                static_cast<uint64_t>(m_mixFormat->nSamplesPerSec);
+            relativePositionHns = m_attachOffsetHns + packetOffsetHns;
+        }
+
+        const bool discontinuity = (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) != 0;
+        if (discontinuity) {
             ++m_stats.discontinuities;
             if (m_options.verbose) {
                 utils::LogVerbose(L"Audio discontinuity detected.");
@@ -290,12 +324,12 @@ void AudioCapture::CaptureAvailablePackets()
         }
 
         const auto bytesToWrite = static_cast<size_t>(frameCount) * static_cast<size_t>(m_mixFormat->nBlockAlign);
-        if (bytesToWrite > 0) {
+        if (bytesToWrite > 0 && m_options.onChunk) {
             if ((flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || data == nullptr) {
                 silenceBuffer.assign(bytesToWrite, 0);
-                m_waveFile->stream.write(reinterpret_cast<const char*>(silenceBuffer.data()), static_cast<std::streamsize>(silenceBuffer.size()));
+                m_options.onChunk(silenceBuffer.data(), silenceBuffer.size(), relativePositionHns, discontinuity);
             } else {
-                m_waveFile->stream.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(bytesToWrite));
+                m_options.onChunk(data, bytesToWrite, relativePositionHns, discontinuity);
             }
             m_stats.bytesWritten += bytesToWrite;
         }

@@ -2,3 +2,5 @@
 *.suo
 /.vs/
 /build/
+/build-obs/
+/vendor/

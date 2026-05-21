@@ -5,7 +5,7 @@
 #include <wrl/client.h>
 
 #include <atomic>
-#include <filesystem>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -16,9 +16,11 @@ class AudioCapture {
 public:
     struct StartOptions {
         DWORD targetPid = 0;
-        std::filesystem::path outputPath;
         bool verbose = false;
         int64_t baseQpc = 0;
+        int64_t attachQpc = 0;
+        std::function<void(const WAVEFORMATEX& format)> onFormat;
+        std::function<void(const BYTE* data, size_t sizeBytes, uint64_t qpcPositionHns, bool discontinuity)> onChunk;
     };
 
     struct Stats {
@@ -29,6 +31,10 @@ public:
         int64_t startQpc = 0;
     };
 
+    struct CoTaskMemFreeDeleter {
+        void operator()(WAVEFORMATEX* value) const;
+    };
+
     AudioCapture();
     ~AudioCapture();
 
@@ -37,14 +43,6 @@ public:
     Stats GetStats() const;
 
 private:
-    struct CoTaskMemFreeDeleter {
-        void operator()(WAVEFORMATEX* value) const;
-    };
-
-    struct WaveFileSession;
-
-    void OpenWaveFile();
-    void FinalizeWaveFile();
     void CaptureLoop();
     void CaptureAvailablePackets();
 
@@ -56,12 +54,17 @@ private:
     Microsoft::WRL::ComPtr<IAudioClient> m_audioClient;
     Microsoft::WRL::ComPtr<IAudioCaptureClient> m_captureClient;
     std::unique_ptr<WAVEFORMATEX, CoTaskMemFreeDeleter> m_mixFormat;
-    std::unique_ptr<WaveFileSession> m_waveFile;
 
     HANDLE m_stopEvent = nullptr;
     HANDLE m_sampleReadyEvent = nullptr;
     HANDLE m_activationCompleteEvent = nullptr;
     std::thread m_captureThread;
+
+    int64_t m_captureStartQpc = 0;
+    uint64_t m_totalCapturedFrames = 0;
+    uint64_t m_attachOffsetHns = 0;
+    uint64_t m_firstPacketQpcHns = 0;
+    uint64_t m_streamLatencyHns = 0;
 };
 
 }  // namespace corebs

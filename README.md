@@ -1,21 +1,40 @@
 # coreBS
 
-`coreBS` is a minimal Windows 11 command-line backup recorder for speedrunning. It captures one target game window, captures only that process tree's audio, and writes a playable backup recording without depending on OBS hooks.
+`coreBS` is a minimal Windows 11 command-line backup recorder for speedrunning.
+
+It records one continuous session from launch until Ctrl+C into a fixed 1920x1080 layout:
+
+- black background
+- target game on the left
+- LiveSplit on the right
+- only the game's process-tree audio
 
 It is intentionally narrow in scope:
 
-- No scenes
-- No streaming
-- No overlays
-- No preview window
-- No plugin system
-- No settings UI
+- no streaming
+- no scene switching
+- no overlays beyond the fixed layout
+- no preview window
+- no runtime plugin or settings system in the recorder
+- no settings UI
 
 ## What it uses
 
-- Video: `Windows.Graphics.Capture` with `IGraphicsCaptureItemInterop::CreateForWindow`
-- Audio: Windows process loopback capture via `ActivateAudioInterfaceAsync` and `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
-- Encoding: Media Foundation H.264 MP4 for video, WAV for audio, then optional FFmpeg muxing to the requested final container
+- Video capture: `Windows.Graphics.Capture` with `IGraphicsCaptureItemInterop::CreateForWindow`
+- Audio capture: Windows process loopback via `ActivateAudioInterfaceAsync` and `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`
+- Video encoding: Media Foundation H.264 MP4
+- Final muxing: FFmpeg as an external tool when audio or container remuxing is needed
+
+## Layout
+
+`coreBS` always records a 1920x1080 session canvas.
+
+- the game is aspect-fit into a large left panel
+- LiveSplit is aspect-fit into a tall right panel
+- unused space stays black
+- game window borders are cropped out by capturing the client area
+
+There is no configurable layout yet. The goal is a reliable backup recording for a game plus timer without them overlapping.
 
 ## Prerequisites
 
@@ -23,110 +42,155 @@ It is intentionally narrow in scope:
 - Visual Studio 2022 with the Desktop development with C++ workload
 - Windows 10/11 SDK with `Windows.Graphics.Capture` support
 - CMake 3.24 or newer
-- Optional but recommended: `ffmpeg.exe` on `PATH`
+- Recommended: `ffmpeg.exe` on `PATH`
 
-If FFmpeg is not available, `coreBS` still succeeds but keeps separate intermediate files when muxing would otherwise be required.
+FFmpeg is used only at finalization time:
 
-## Build in Visual Studio
+- to mux the continuous MP4 video with the captured WAV audio
+- or to remux the final file if you requested a non-MP4 container
 
-1. Open a `x64 Native Tools Command Prompt for VS 2022`.
-2. Configure the project:
+If FFmpeg is missing, `coreBS` still exits successfully, but it keeps the temporary session files instead of producing the final muxed output.
+
+## Build
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-```
-
-3. Build it:
-
-```powershell
 cmake --build build --config Release
 ```
 
 The executable will be at `build\Release\coreBS.exe`.
 
-## Build with CMake only
+## Optional OBS source plugin
 
-```powershell
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
+The main recorder is standalone. `obs-plugin/` contains an experimental OBS source plugin that reuses the same window-capture helpers when OBS integration is useful for testing.
+
+That plugin is opt-in through `-DCOREBS_BUILD_OBS_PLUGIN=ON` and has its own setup notes in `obs-plugin/README.md`. Local OBS source trees, SDK staging folders, and generated plugin builds stay outside the repository under ignored `vendor/` and `build-obs/` directories.
 
 ## CLI examples
 
-Capture by exe name:
+Start `coreBS` before launching the game:
 
 ```powershell
-coreBS.exe --exe LEGOStarWars.exe
+coreBS.exe --exe LEGOStarWars.exe --fps 60
 ```
 
-Capture by PID with explicit output:
+Target by window title instead:
 
 ```powershell
-coreBS.exe --pid 1234 --fps 60 --out D:\Runs\backup.mkv
+coreBS.exe --title "LEGO Star Wars - The Complete Saga" --verbose
 ```
 
-Capture by window title, disable cursor, and print verbose diagnostics:
+Write to a specific file and override the LiveSplit title match:
 
 ```powershell
-coreBS.exe --title "LEGO Star Wars - The Complete Saga" --no-cursor --verbose
+coreBS.exe --exe LEGOStarWars.exe --out D:\Runs\backup.mkv --livesplit-title "LiveSplit"
 ```
 
-Disable application audio on purpose:
+Disable target-process audio on purpose:
 
 ```powershell
 coreBS.exe --exe LEGOStarWars.exe --audio-off --out D:\Runs\video_only.mp4
 ```
 
-## Behavior
+Fail immediately if the game is not available yet:
 
-- Exactly one of `--exe`, `--pid`, or `--title` must be provided.
-- `coreBS` resolves the target PID first, then resolves the best visible top-level window for that PID.
-- Invisible, minimized, tool, child, and zero-sized windows are rejected.
-- Ctrl+C stops capture, finalizes output, and returns success.
-- If the target process exits, recording stops and finalizes automatically.
-- If `--out` is omitted, `coreBS` creates a timestamped output name in the current working directory.
-- If audio is enabled, the default final container is `.mkv`.
-- If audio is disabled, the default final container is `.mp4`.
+```powershell
+coreBS.exe --exe LEGOStarWars.exe --no-wait
+```
 
-## Output strategy
+## Waiting mode and automatic attach
 
-`coreBS` prefers reliability over elegance:
+`coreBS` defaults to `--wait` mode.
 
-- Video is always written first as H.264 MP4 through Media Foundation.
-- Audio is written as WAV through process loopback capture.
-- If the requested final output needs muxing, `coreBS` invokes `ffmpeg.exe` as a post-step.
-- If FFmpeg is missing or muxing fails, `coreBS` exits successfully with a warning and keeps the intermediate files.
+That means you can start the recorder first, then launch the game later. `coreBS` will:
 
-Examples:
+- start the session recording immediately
+- keep writing the continuous timeline even while the game is absent
+- wait for the target process or title match instead of failing immediately
+- keep retrying if the process exists but the window is minimized or otherwise not captureable yet
+- attach automatically once a visible top-level window is ready
+- capture the game again after restarts when using `--exe` or `--title`
 
-- `--audio-off --out backup.mp4`: writes `backup.mp4` directly.
-- `--audio-off --out backup.mkv`: writes `backup.video.mp4` first, then remuxes to `backup.mkv` if FFmpeg exists.
-- `--out backup.mkv`: writes `backup.video.mp4` and `backup.audio.wav`, then muxes them into `backup.mkv` if FFmpeg exists.
+While the game is missing, the game panel stays black. LiveSplit can stay visible for the whole session if its window remains available.
+
+## Stable target identity
+
+For restart-tolerant workflows, prefer:
+
+- `--exe LEGOStarWars.exe`
+- `--title "LEGO Star Wars - The Complete Saga"`
+
+`--pid` only refers to the current process instance, so it is not stable across restarts.
+
+## Continuous output behavior
+
+`coreBS` records one continuous session from startup to Ctrl+C.
+
+That means:
+
+- time before the game launches is preserved
+- time while the game is closed between restarts is preserved
+- LiveSplit can remain visible for the full session
+- the final recording is one session file when muxing succeeds
+
+Internally, `coreBS` writes a temporary session video MP4 and, when audio is enabled, a temporary session WAV. At shutdown it finalizes those files and muxes them into the requested output when FFmpeg is available.
+
+## Example speedrun workflow
+
+1. Start `coreBS.exe --exe LEGOStarWars.exe --fps 60 --out D:\Runs\session.mkv`.
+2. Leave the recorder running.
+3. Launch the game.
+4. Keep LiveSplit open.
+5. Play, reset, or relaunch the game as needed.
+6. Press Ctrl+C when the run session is really over.
+7. `coreBS` finalizes the continuous output and exits cleanly.
+
+## Logging behavior
+
+`coreBS` logs the main transitions, including:
+
+- waiting for target
+- process found
+- window found
+- attached to PID / HWND
+- target exited
+- returned to waiting mode
+- reattached to new PID / HWND
+- LiveSplit attach / loss
+- user interrupted with Ctrl+C
+- final shutdown complete
+
+Use `--verbose` to also print audio discontinuities and external tool launch commands.
 
 ## How to verify that only the target app audio is captured
 
-1. Start the target game and something unrelated that also makes noise, like a browser video or music player.
+1. Start the target game and something unrelated that also makes sound, like a browser video or music player.
 2. Run `coreBS.exe --exe LEGOStarWars.exe --out test.mkv --verbose`.
-3. Let the game produce audio while the unrelated app also produces audio.
-4. Stop the capture with Ctrl+C.
-5. Play the result. The game audio should be present, and the unrelated app audio should be absent.
+3. Let both apps produce audio.
+4. Stop the session with Ctrl+C.
+5. Play the result.
 
-If FFmpeg was not available, inspect `test.audio.wav` and `test.video.mp4` separately instead.
+The game audio should be present. The unrelated app audio should be absent.
 
-## How to test while OBS is also running
+## Testing with OBS also running
 
-`coreBS` does not use OBS APIs or OBS game hooks.
+`coreBS` does not use OBS hooks or OBS game capture APIs.
 
 1. Start OBS.
-2. Add any OBS capture source you want, including Game Capture.
-3. Launch the game.
-4. Start `coreBS` against the same target window.
-5. Verify `coreBS` records and finalizes independently even if OBS Game Capture behaves differently.
+2. Leave OBS open however you normally use it.
+3. Start `coreBS`.
+4. Launch the game and keep LiveSplit open.
+5. Verify `coreBS` keeps producing its own independent backup recording.
 
 ## Known limitations and compromises
 
-- Video output keeps the initial capture resolution and rescales later frames into that fixed size if the game window changes size.
-- The current video path uses CPU readback from the capture texture before handing frames to Media Foundation. This keeps the code simple and reliable, but it is not the most efficient possible implementation.
-- Audio is written as standard RIFF WAV before muxing, so extremely long captures can hit WAV size limits.
-- If FFmpeg is missing, a requested `.mkv` or muxed `.mp4` final file is not produced automatically; the intermediate files are preserved instead.
+- The layout is currently fixed at 1920x1080.
+- LiveSplit is matched by window title text, defaulting to `LiveSplit`.
+- If LiveSplit is missing or minimized, its panel stays black.
+- If the game is running but minimized, hidden, or otherwise not captureable, `coreBS` keeps waiting and the game panel stays black.
+- Audio is captured only while the target game process is attached.
+- If the game's audio format changes between separate launches in the same session, later audio is ignored and a warning is printed.
+- Audio temp files use standard RIFF WAV sizing, so extremely long audio sessions can hit WAV size limits before final muxing.
+- The current compositor uses CPU copies and simple scaling to keep the implementation small and reliable.
+- FFmpeg is still needed for final audio muxing or non-MP4 final containers.
 - The recorder is Windows-only by design.
