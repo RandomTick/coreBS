@@ -20,7 +20,7 @@ if(NOT OBS_LIBRARY AND EXISTS "${COREBS_OBS_SDK_ROOT}/lib/obs.lib")
 endif()
 
 if(NOT OBS_INCLUDE_DIR)
-    message(FATAL_ERROR "COREBS_BUILD_OBS_PLUGIN requires OBS_INCLUDE_DIR to point at the OBS SDK headers (directory containing obs-module.h).")
+    message(FATAL_ERROR "OBS_INCLUDE_DIR must point at the OBS SDK headers (directory containing obs-module.h).")
 endif()
 
 if(NOT EXISTS "${OBS_INCLUDE_DIR}/obs-module.h")
@@ -28,7 +28,7 @@ if(NOT EXISTS "${OBS_INCLUDE_DIR}/obs-module.h")
 endif()
 
 if(NOT OBS_LIBRARY)
-    message(FATAL_ERROR "COREBS_BUILD_OBS_PLUGIN requires OBS_LIBRARY to point at the OBS/libobs import library.")
+    message(FATAL_ERROR "OBS_LIBRARY must point at the OBS/libobs import library.")
 endif()
 
 if(EXISTS "${COREBS_OBS_SOURCE_ROOT}/libobs/obsconfig.h.in")
@@ -48,17 +48,20 @@ add_library(${COREBS_OBS_PLUGIN_TARGET} MODULE
     src/plugin-main.cpp
     src/game-capture-source.cpp
     src/game-capture-source.h
-    ../src/ProcessFinder.cpp
-    ../src/Utils.cpp
-    ../src/WindowCaptureSource.cpp
-    ../src/WindowFinder.cpp
+    src/ProcessFinder.cpp
+    src/ProcessFinder.h
+    src/Utils.cpp
+    src/Utils.h
+    src/WindowCaptureSource.cpp
+    src/WindowCaptureSource.h
+    src/WindowFinder.cpp
+    src/WindowFinder.h
 )
 
 target_include_directories(${COREBS_OBS_PLUGIN_TARGET} PRIVATE
     ${OBS_INCLUDE_DIR}
     ${COREBS_OBS_CONFIG_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src
 )
 
 if(MSVC)

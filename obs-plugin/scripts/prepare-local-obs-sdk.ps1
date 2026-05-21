@@ -84,6 +84,6 @@ Write-Host "  Headers: $ObsSourceRoot\\libobs"
 Write-Host "  Import lib: $libPath"
 Write-Host ''
 Write-Host 'Next steps:' -ForegroundColor Green
-Write-Host '  cmake -S . -B build-obs -G "Visual Studio 17 2022" -A x64 -DCOREBS_BUILD_OBS_PLUGIN=ON'
-Write-Host '  cmake --build build-obs --config Release'
-Write-Host '  cmake --install build-obs --config Release --prefix build-obs\\obs-package'
+Write-Host '  cmake -S . -B build -G "Visual Studio 17 2022" -A x64'
+Write-Host '  cmake --build build --config Release'
+Write-Host '  cmake --install build --config Release --prefix build\\obs-package'

@@ -18,7 +18,6 @@ public:
     static std::vector<ProcessInfo> EnumerateProcesses();
     static std::vector<ProcessInfo> FindByExeName(const std::wstring& exeName);
     static std::optional<ProcessInfo> FindByPid(DWORD pid);
-    static HANDLE OpenProcessForMonitoring(DWORD pid);
 };
 
 }  // namespace corebs

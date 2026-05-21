@@ -1,8 +1,8 @@
 #pragma once
 
-#include "../../src/ProcessFinder.h"
-#include "../../src/WindowCaptureSource.h"
-#include "../../src/WindowFinder.h"
+#include "ProcessFinder.h"
+#include "WindowCaptureSource.h"
+#include "WindowFinder.h"
 
 #include <obs-module.h>
 
@@ -14,7 +14,7 @@ namespace corebs::obs_plugin {
 
 class GameCaptureSource {
 public:
-    explicit GameCaptureSource(obs_source_t* source);
+    GameCaptureSource();
     ~GameCaptureSource();
 
     void Update(obs_data_t* settings);
@@ -54,10 +54,9 @@ private:
     void UploadLatestFrame();
     bool ShouldPoll(int64_t nowQpc) const;
     bool ActiveWindowStillValid() const;
-    std::optional<ResolvedTarget> TryResolveTarget(bool& sawMatchingProcess) const;
+    std::optional<ResolvedTarget> TryResolveTarget() const;
     static std::wstring ReadWideString(obs_data_t* settings, const char* key);
 
-    obs_source_t* m_source = nullptr;
     TargetSelection m_selection{};
 
     mutable std::mutex m_mutex;

@@ -49,13 +49,4 @@ std::optional<ProcessInfo> ProcessFinder::FindByPid(DWORD pid)
     return std::nullopt;
 }
 
-HANDLE ProcessFinder::OpenProcessForMonitoring(DWORD pid)
-{
-    HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == nullptr) {
-        utils::Fail(L"OpenProcess failed for PID " + std::to_wstring(pid) + L": " + utils::FormatWindowsError(GetLastError()));
-    }
-    return process;
-}
-
 }  // namespace corebs

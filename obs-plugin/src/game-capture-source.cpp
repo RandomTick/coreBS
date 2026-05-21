@@ -1,6 +1,6 @@
 #include "game-capture-source.h"
 
-#include "../../src/Utils.h"
+#include "Utils.h"
 
 #include <graphics/graphics.h>
 
@@ -32,7 +32,8 @@ const char* GetSourceName(void*)
 
 void* CreateSource(obs_data_t* settings, obs_source_t* source)
 {
-    auto* instance = new GameCaptureSource(source);
+    (void)source;
+    auto* instance = new GameCaptureSource();
     instance->Update(settings);
     return instance;
 }
@@ -91,10 +92,7 @@ GameCaptureSource::TargetMode ParseMode(std::string_view mode)
 
 }  // namespace
 
-GameCaptureSource::GameCaptureSource(obs_source_t* source)
-    : m_source(source)
-{
-}
+GameCaptureSource::GameCaptureSource() = default;
 
 GameCaptureSource::~GameCaptureSource()
 {
@@ -221,9 +219,7 @@ void GameCaptureSource::UpdateAttachment()
         return;
     }
 
-    bool sawMatchingProcess = false;
-    const auto resolved = TryResolveTarget(sawMatchingProcess);
-    (void)sawMatchingProcess;
+    const auto resolved = TryResolveTarget();
     m_lastPollQpc = nowQpc;
 
     if (resolved.has_value()) {
@@ -318,10 +314,8 @@ bool GameCaptureSource::ActiveWindowStillValid() const
     });
 }
 
-std::optional<GameCaptureSource::ResolvedTarget> GameCaptureSource::TryResolveTarget(bool& sawMatchingProcess) const
+std::optional<GameCaptureSource::ResolvedTarget> GameCaptureSource::TryResolveTarget() const
 {
-    sawMatchingProcess = false;
-
     switch (m_selection.mode) {
     case TargetMode::Pid: {
         if (!m_selection.pid.has_value()) {
@@ -333,7 +327,6 @@ std::optional<GameCaptureSource::ResolvedTarget> GameCaptureSource::TryResolveTa
             return std::nullopt;
         }
 
-        sawMatchingProcess = true;
         const auto window = WindowFinder::FindBestWindowForPid(*m_selection.pid);
         if (!window.has_value()) {
             return std::nullopt;
@@ -355,7 +348,6 @@ std::optional<GameCaptureSource::ResolvedTarget> GameCaptureSource::TryResolveTa
             return std::nullopt;
         }
 
-        sawMatchingProcess = true;
         return ResolvedTarget{*process, windows.front()};
     }
     case TargetMode::Exe:
@@ -369,7 +361,6 @@ std::optional<GameCaptureSource::ResolvedTarget> GameCaptureSource::TryResolveTa
             return std::nullopt;
         }
 
-        sawMatchingProcess = true;
         std::optional<ResolvedTarget> bestMatch;
         long long bestScore = -1;
 
